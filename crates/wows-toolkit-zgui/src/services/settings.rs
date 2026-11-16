@@ -4,10 +4,12 @@
 //! them holds in all of them.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::Serialize;
 use sqlx::sqlite::SqlitePool;
 use tokio::runtime::Runtime;
+use tokio_util::task::TaskTracker;
 use wows_core::pseudonym::NameDisplay;
 use wows_toolkit_config::queries::ArmorViewerDefaultsRow;
 use wows_toolkit_services::settings::StartupSettings;
@@ -22,9 +24,6 @@ use zgui::reactive::prelude::SetValue;
 use zgui::reactive::prelude::Update;
 use zgui::reactive::prelude::With;
 use zgui::reactive::prelude::WithUntracked;
-use zgui::task::spawn_detached;
-
-use crate::services::on_tokio;
 
 /// Where the settings read has got.
 pub enum SettingsState {
@@ -169,18 +168,22 @@ impl Settings {
 
     /// Commits `pending` once its turn comes, unless a newer save has overtaken it.
     ///
-    /// Detached: a save must land even when the view that made it goes away first.
+    /// On the tokio runtime rather than the UI executor, and tracked: a save must land even when
+    /// the view that made it goes away first, and when the app quits straight after it
+    /// ([`finish_pending_writes`]).
     fn commit_detached(self, pending: PendingWrite) {
-        let runtime = self.runtime.get_value();
-        spawn_detached(async move {
-            let key = pending.key();
+        let key = pending.key();
+        let Some(runtime) = self.runtime.get_value() else {
+            tracing::error!("settings: {key} was not written because no tokio runtime is running");
+            return;
+        };
+
+        runtime.spawn(WRITES_IN_FLIGHT.track_future(async move {
             let Some(write) = pending.turn().await else { return };
-            match on_tokio(runtime, write.commit()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => tracing::error!("settings: {key} could not be written: {err}"),
-                Err(err) => tracing::error!("settings: the write of {key} did not complete: {err}"),
+            if let Err(err) = write.commit().await {
+                tracing::error!("settings: {key} could not be written: {err}");
             }
-        });
+        }));
     }
 
     /// The open config pool, for the readers that query it directly. `None` before the startup
@@ -188,6 +191,20 @@ impl Settings {
     /// window that owns them.
     pub fn pool(self) -> Option<SqlitePool> {
         self.writer.try_get_value().flatten().map(|writer| writer.pool().clone())
+    }
+}
+
+/// The settings writes not yet committed. Process-wide: the services that start them are gone by
+/// the time the window loop returns, and the writes have to outlive them.
+static WRITES_IN_FLIGHT: std::sync::LazyLock<TaskTracker> = std::sync::LazyLock::new(TaskTracker::new);
+
+/// Waits up to `timeout` for every settings write already started to commit. Called once the
+/// window loop has returned, before the runtime is dropped and aborts them.
+pub fn finish_pending_writes(runtime: &Runtime, timeout: Duration) {
+    WRITES_IN_FLIGHT.close();
+    // Built inside the runtime: a tokio timer made outside one panics.
+    if runtime.block_on(async { tokio::time::timeout(timeout, WRITES_IN_FLIGHT.wait()).await }).is_err() {
+        tracing::warn!("settings: {} writes were still pending at exit and are lost", WRITES_IN_FLIGHT.len());
     }
 }
 
@@ -206,4 +223,38 @@ thread_local! {
 #[cfg(test)]
 pub fn saved_for_test() -> Vec<(&'static str, String)> {
     SAVED.with(|saved| saved.borrow().clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use wows_toolkit_services::settings::StartupSettings;
+    use zgui::reactive::Mounted;
+
+    use super::finish_pending_writes;
+    use crate::services::Services;
+
+    /// A setting changed just before the app quits is in the database once the exit has waited
+    /// for it, though the window and its executor are already gone.
+    #[test]
+    fn a_write_made_just_before_exit_lands() {
+        const KEY: &str = "zgui_test_written_at_exit";
+
+        zgui::reactive::install().expect("the reactive runtime installs");
+        let runtime = Arc::new(wows_toolkit_services::runtime::build().expect("a tokio runtime starts"));
+        let main = Mounted::new();
+        let services = main.with(|| Services::provide(Some(Arc::clone(&runtime))));
+        let pool = runtime.block_on(wows_toolkit_config::test_pool());
+        let settings = runtime.block_on(StartupSettings::load(&pool));
+        services.settings.adopt(settings, pool.clone());
+
+        services.settings.save(KEY, &"quit");
+        main.unmount();
+        finish_pending_writes(&runtime, Duration::from_secs(5));
+
+        let stored = runtime.block_on(wows_toolkit_config::queries::get_setting::<String>(&pool, KEY));
+        assert_eq!(stored.as_deref(), Some("quit"));
+    }
 }
